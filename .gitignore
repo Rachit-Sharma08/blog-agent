@@ -1,0 +1,6 @@
+.env
+.env.*
+node_modules/
+
+# The template is tracked; the real env file never is.
+!.env.example
