@@ -1,0 +1,43 @@
+# Runs the draft generator on a schedule: Monday, Wednesday and Friday at
+# 03:30 UTC. GitHub Actions cron is always interpreted in UTC, so this slot is
+# 09:00 IST and stays fixed no matter where the runner or the repository is.
+# The same run can be started by hand from the Actions tab (workflow_dispatch).
+# Secrets are handed to the step as environment variables and are never echoed.
+name: Generate blog draft
+
+on:
+  schedule:
+    - cron: '30 3 * * 1,3,5'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: generate-draft
+  cancel-in-progress: false
+
+jobs:
+  generate-draft:
+    name: Generate draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # No npm install: generate-draft.mjs uses only built-in Node features.
+      - name: Generate and save draft
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_MODEL: ${{ secrets.OPENROUTER_MODEL }}
+        run: node generate-draft.mjs --save
