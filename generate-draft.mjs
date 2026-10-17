@@ -151,7 +151,14 @@ function bulletList(items) {
 function buildPrompt({ existing, recent }) {
   return `You are writing one new draft for the personal blog of Rachit Sharma, a digital marketer from Kaithal, Haryana, India who works hands-on with AI tools. The blog's beat is digital marketing and AI work.
 
-Voice: first person, calm and concrete - real observations, specific process, honest trade-offs. No hype, no filler ("in today's fast-paced world"), no keyword stuffing. Short paragraphs.
+Voice: first person, calm and concrete - specific process, honest trade-offs. No hype, no filler ("in today's fast-paced world"), no keyword stuffing. Short paragraphs.
+
+FACTUAL HONESTY - these posts are published under a real person's name, so nothing may be made up:
+  - Never invent clients, companies, case studies, personal experiences, past events, quotes or results. Never write sentences like "last year I...", "a client of mine...", "when we did this for...".
+  - First person is allowed ONLY for opinions and the recommended approach (for example "I would start with...", "I would look at..."), never to claim past experience, delivered work or results.
+  - No specific statistics, percentages, prices or study results unless they are widely known facts, and then stated cautiously ("studies often find...", "in most cases...").
+  - Example arithmetic is allowed only when it is clearly hypothetical and uses round numbers (for example "say you spend 5,000 rupees a month on ads..."), and must read as an example, never as a measured result.
+  - If you do not know a fact, describe the approach or say that it depends - never fill the gap with a number or a story.
 
 Existing posts - every title and category is already covered. The new topic must not be the same as, or similar to, any of these:
 ${bulletList(existing)}
@@ -242,6 +249,20 @@ async function generateDraftRequest(providerName, request) {
   }
 }
 
+/**
+ * Providers may split one answer into several text parts. Joining them with an
+ * empty string can fuse the last word of one part with the first word of the
+ * next ("leads" + "acquired" -> "leadsacquired"), so a part boundary that has
+ * no whitespace on either side gets a single space. Whitespace at the
+ * boundary - including a newline - is kept as it is, never deleted.
+ */
+function joinTextParts(parts) {
+  return parts.reduce((text, part) => {
+    if (!text || /\s$/.test(text) || /^\s/.test(part)) return text + part
+    return `${text} ${part}`
+  }, '')
+}
+
 async function askGemini(env, prompt) {
   const model = env.geminiModel.replace(/^models\//, '')
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`
@@ -260,10 +281,11 @@ async function askGemini(env, prompt) {
   const data = await response.json()
   const parts = data?.candidates?.[0]?.content?.parts
   const text = Array.isArray(parts)
-    ? parts
-        .filter((part) => part && typeof part.text === 'string' && part.thought !== true)
-        .map((part) => part.text)
-        .join('')
+    ? joinTextParts(
+        parts
+          .filter((part) => part && typeof part.text === 'string' && part.thought !== true)
+          .map((part) => part.text),
+      )
     : ''
   if (!text.trim()) {
     const reason = data?.promptFeedback?.blockReason
@@ -289,7 +311,7 @@ async function askOpenRouter(env, prompt) {
   const data = await response.json()
   const content = data?.choices?.[0]?.message?.content
   const text = Array.isArray(content)
-    ? content.map((part) => part?.text ?? '').join('')
+    ? joinTextParts(content.map((part) => part?.text ?? ''))
     : String(content ?? '')
   if (!text.trim()) throw new InvalidOutputError('no text returned')
   return text
@@ -341,6 +363,31 @@ async function insertDraft(env, draft, slug) {
   if (!response.ok) fail(`Supabase insert failed (HTTP ${response.status}).`)
 }
 
+/**
+ * Safety net for the fabrication rule in the prompt: if the model slipped a
+ * personal story past it anyway, say so loudly. Nothing is blocked and nothing
+ * is rewritten - the draft is only reported, and a human reads it either way.
+ */
+const FABRICATION_PATTERNS = [
+  'my client',
+  'our client',
+  'a client of mine',
+  'last year i',
+  'years ago i',
+  'i once ',
+  'when we did this',
+  'i worked with',
+]
+
+function warnOnFabrication(draft) {
+  const haystack = String(draft?.content ?? '').toLowerCase()
+  const hits = FABRICATION_PATTERNS.filter((pattern) => haystack.includes(pattern))
+  if (hits.length === 0) return
+  console.log('')
+  console.log(`WARNING: possible fabricated personal story in the draft (matched: ${hits.join(', ')}).`)
+  console.log('The draft is NOT blocked - but these phrases must not be published under a real name. Rewrite or delete them first.')
+}
+
 function printDraft(draft) {
   console.log('')
   console.log('--- Draft -------------------------------------------------------')
@@ -381,6 +428,7 @@ async function main() {
   }
 
   console.log(`Provider used: ${provider}`)
+  warnOnFabrication(draft)
   printDraft(draft)
 
   if (!SAVE) {
