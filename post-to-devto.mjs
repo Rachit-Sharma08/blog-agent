@@ -31,6 +31,13 @@ const REQUEST_TIMEOUT_MS = 60_000
 const DEVTO_API = 'https://dev.to/api'
 const DEVTO_USER_AGENT = 'blog-agent'
 
+/**
+ * Appended to the end of every cross-posted body, after the canonical link,
+ * so dev.to readers see that the text is not presented as purely human-written.
+ * Single place to edit the wording.
+ */
+const AI_DISCLOSURE_LINE = '*Drafted with the help of AI and reviewed by the author before publishing.*'
+
 const REQUIRED_ENV = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'DEVTO_API_KEY', 'SITE_URL']
 
 class HttpError extends Error {
@@ -215,10 +222,14 @@ function findDuplicateMatches(articles, canonicalUrl, title) {
   return [...new Set(matches)]
 }
 
-/** dev.to tags: lowercase letters and numbers only, unique, max 4. */
+/**
+ * dev.to tags: lowercase letters and numbers only, unique, max 4.
+ * The AI-disclosure tag "abotwrotethis" is always present and must never be
+ * dropped by the cap - only three values go in, so the cap cannot reach it.
+ */
 function buildTags(category) {
   const tags = []
-  for (const value of [category, 'marketing']) {
+  for (const value of [category, 'marketing', 'abotwrotethis']) {
     const tag = String(value ?? '')
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, '')
@@ -242,7 +253,7 @@ function absoluteHttpsUrl(value) {
 /** The exact JSON body for POST /api/articles, minus nothing - no key inside. */
 function buildArticle(env, post, published) {
   const canonicalUrl = canonicalUrlFor(env, post.slug)
-  const bodyMarkdown = `${post.content}\n\n*Originally published at [${canonicalUrl}](${canonicalUrl})*`
+  const bodyMarkdown = `${post.content}\n\n*Originally published at [${canonicalUrl}](${canonicalUrl})*\n\n${AI_DISCLOSURE_LINE}`
   const article = {
     title: post.title,
     body_markdown: bodyMarkdown,
