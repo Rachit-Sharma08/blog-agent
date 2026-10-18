@@ -1,0 +1,182 @@
+# The MORNING half of the "review window" flow: it finds the oldest open
+# "pending-publish" Issue (opened by the evening workflow), publishes that one
+# draft for real, triggers the site rebuild, cross-posts to dev.to and then
+# closes the Issue with a plain-words summary. Monday, Wednesday and Friday at
+# 03:30 UTC = 09:00 IST. GitHub Actions cron is always interpreted in UTC, so
+# this slot stays fixed no matter where the runner or the repository is. The
+# same run can be started by hand from the Actions tab (workflow_dispatch).
+# The Issue body is untrusted text: only a line matching the slug pattern is
+# ever read from it, it reaches the shell through env: only, and it is never
+# inline in the script text. Secrets are handed to the steps as environment
+# variables and are never echoed.
+name: Publish approved draft
+
+on:
+  schedule:
+    - cron: '30 3 * * 1,3,5'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: publish-draft
+  cancel-in-progress: false
+
+jobs:
+  publish-draft:
+    name: Publish approved draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # No npm install: publish-draft.mjs uses only built-in Node features.
+      # The OLDEST open pending-publish Issue wins. With no Issue - or an Issue
+      # whose body has no valid slug line - the step prints "nothing pending"
+      # and sets no outputs, so every later step skips and the run succeeds.
+      # The body is untrusted: only a line matching ^slug: <kebab-slug>$ is read
+      # and only the slug itself is kept.
+      - name: Find the oldest pending Issue
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          issues=$(gh issue list --label pending-publish --state open --json number,body,createdAt --limit 20)
+          echo "Open pending-publish Issues: $(printf '%s' "$issues" | jq 'length')"
+
+          number=$(printf '%s' "$issues" | jq -r 'sort_by(.createdAt)[0].number // empty')
+          body=$(printf '%s' "$issues" | jq -r 'sort_by(.createdAt)[0].body // empty')
+
+          slug_re='^slug: ([a-z0-9]+(-[a-z0-9]+)*)$'
+          slug=""
+          while IFS= read -r line; do
+            if [[ "$line" =~ $slug_re ]]; then
+              slug="${BASH_REMATCH[1]}"
+              break
+            fi
+          done <<< "$body"
+
+          if [ -z "$number" ] || [ -z "$slug" ]; then
+            echo "nothing pending"
+            exit 0
+          fi
+
+          echo "Oldest pending Issue: #$number -> slug: $slug"
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+          echo "slug=$slug" >> "$GITHUB_OUTPUT"
+
+      # --apply is the only mode that writes: publish-draft.mjs flips this one
+      # row from published=false to published=true and writes status= into
+      # $GITHUB_OUTPUT (published, blocked, missing, already-published, dry-run-ok).
+      - name: Publish the draft
+        id: pub
+        if: steps.find.outputs.slug != ''
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SLUG: ${{ steps.find.outputs.slug }}
+        run: node publish-draft.mjs --slug "$SLUG" --apply
+
+      # The hook URL is read from the env: value only and is never echoed.
+      # Without the secret the step warns and still succeeds, so the run - and
+      # the dev.to cross-post below - are not failed by a missing hook.
+      - name: Trigger the site rebuild
+        id: rebuild
+        if: steps.pub.outputs.status == 'published'
+        env:
+          VERCEL_DEPLOY_HOOK: ${{ secrets.VERCEL_DEPLOY_HOOK }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${VERCEL_DEPLOY_HOOK:-}" ]; then
+            echo "WARNING: the VERCEL_DEPLOY_HOOK secret is not set, so the site rebuild was skipped."
+            echo "result=no-hook" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          curl -fsS -X POST "$VERCEL_DEPLOY_HOOK"
+          echo "The rebuild hook answered OK."
+          echo "result=triggered" >> "$GITHUB_OUTPUT"
+
+      # --post is the real cross-post (published: true on dev.to) and
+      # --wait-live 10 waits up to 10 minutes for /blog/<slug> to show up in the
+      # sitemap, which the rebuild above has only just started producing.
+      # continue-on-error: the blog post is already live, so a dev.to hiccup
+      # must not fail the run.
+      - name: Cross-post to dev.to
+        id: devto
+        if: steps.pub.outputs.status == 'published'
+        continue-on-error: true
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          DEVTO_API_KEY: ${{ secrets.DEVTO_API_KEY }}
+          SITE_URL: ${{ secrets.SITE_URL }}
+          SLUG: ${{ steps.find.outputs.slug }}
+        run: node post-to-devto.mjs --slug "$SLUG" --post --wait-live 10
+
+      # Always runs, even when publishing or a later step failed, so the Issue
+      # never stays open without an answer.
+      - name: Comment on and close the Issue
+        if: always() && steps.find.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.find.outputs.number }}
+          SLUG: ${{ steps.find.outputs.slug }}
+          STATUS: ${{ steps.pub.outputs.status }}
+          REBUILD_RESULT: ${{ steps.rebuild.outputs.result }}
+          REBUILD_OUTCOME: ${{ steps.rebuild.outcome }}
+          DEVTO_OUTCOME: ${{ steps.devto.outcome }}
+        run: |
+          set -euo pipefail
+
+          case "${STATUS:-}" in
+            published) was="was PUBLISHED" ;;
+            blocked) was="was NOT published - the safety checks failed (see the run log)" ;;
+            missing) was="was NOT published - the draft row was not found in Supabase" ;;
+            already-published) was="was NOT changed - it was already published" ;;
+            dry-run-ok) was="was NOT published - the script ran without --apply" ;;
+            *) was="was NOT published - the publish step reported no status (see the run log)" ;;
+          esac
+
+          if [ "${REBUILD_OUTCOME:-}" = "success" ]; then
+            case "${REBUILD_RESULT:-}" in
+              triggered) rebuild="The site rebuild was triggered." ;;
+              no-hook) rebuild="The site rebuild was SKIPPED because the VERCEL_DEPLOY_HOOK secret is not set - publish again from the admin panel when the secret exists." ;;
+              *) rebuild="The site rebuild step finished without reporting a result." ;;
+            esac
+          elif [ "${REBUILD_OUTCOME:-}" = "skipped" ]; then
+            rebuild="The site rebuild was skipped (nothing was published)."
+          else
+            rebuild="The site rebuild FAILED (see the run log)."
+          fi
+
+          case "${DEVTO_OUTCOME:-}" in
+            success) devto="The dev.to cross-post ran - the run log shows the article URL, or says there was nothing to post." ;;
+            skipped) devto="The dev.to cross-post was skipped (nothing was published)." ;;
+            *) devto="The dev.to cross-post FAILED - the blog post itself is unaffected." ;;
+          esac
+
+          body=$(printf '%s\n' \
+            "Review window - morning run for the draft with slug: $SLUG" \
+            "" \
+            "The draft $was." \
+            "" \
+            "$rebuild" \
+            "$devto" \
+            "" \
+            "If the draft was not published, it is untouched in the admin panel - fix it there and the next evening run opens a fresh Issue.")
+
+          gh issue comment "$ISSUE_NUMBER" --body "$body"
+          gh issue close "$ISSUE_NUMBER"
+          echo "Issue #$ISSUE_NUMBER commented and closed."
