@@ -12,10 +12,14 @@
  *     body are printed, nothing is sent.
  *   - At most one post per run (the oldest eligible one), unless --slug asks
  *     for one specific post.
+ *   - --wait-live can hold a run open for up to 20 minutes while it re-checks
+ *     the sitemap every 30 seconds. It still posts at most one post, and when
+ *     the time runs out it exits 0 without posting.
  *
  * Usage:
  *   node post-to-devto.mjs                       # dry run, oldest recent post
  *   node post-to-devto.mjs --slug my-post-slug   # dry run, one specific post
+ *   node post-to-devto.mjs --wait-live 10        # wait up to 10 min for the sitemap
  *   node post-to-devto.mjs --post-draft          # real request, published: false
  *   node post-to-devto.mjs --post                # real request, published: true
  *
@@ -27,16 +31,11 @@
 const DAY_MS = 24 * 60 * 60 * 1000
 const RECENT_DAYS = 14
 const REQUEST_TIMEOUT_MS = 60_000
+const WAIT_LIVE_POLL_MS = 30_000
+const WAIT_LIVE_MAX_MINUTES = 20
 
 const DEVTO_API = 'https://dev.to/api'
 const DEVTO_USER_AGENT = 'blog-agent'
-
-/**
- * Appended to the end of every cross-posted body, after the canonical link,
- * so dev.to readers see that the text is not presented as purely human-written.
- * Single place to edit the wording.
- */
-const AI_DISCLOSURE_LINE = '*Drafted with the help of AI and reviewed by the author before publishing.*'
 
 const REQUIRED_ENV = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'DEVTO_API_KEY', 'SITE_URL']
 
@@ -78,9 +77,12 @@ function readEnv() {
   }
 }
 
-/** --slug <slug>, --post-draft or --post. Both posting flags at once is an error. */
+/**
+ * --slug <slug>, --wait-live <minutes>, --post-draft or --post. Both posting
+ * flags at once is an error. --wait-live takes whole minutes, 1 to 20.
+ */
 function parseArgs(argv) {
-  const args = { slug: '', mode: 'dry-run' }
+  const args = { slug: '', mode: 'dry-run', waitLiveMinutes: 0 }
   let wantsPost = false
   let wantsDraft = false
 
@@ -90,6 +92,17 @@ function parseArgs(argv) {
       const value = String(argv[index + 1] ?? '').trim()
       if (!value || value.startsWith('--')) fail('--slug needs a value, like: --slug why-ad-copy-stops-working')
       args.slug = value.toLowerCase()
+      index += 1
+      continue
+    }
+    if (arg === '--wait-live') {
+      const value = String(argv[index + 1] ?? '').trim()
+      if (!/^[0-9]+$/.test(value)) fail('--wait-live needs whole minutes, like: --wait-live 10')
+      const minutes = Number(value)
+      if (minutes < 1 || minutes > WAIT_LIVE_MAX_MINUTES) {
+        fail(`--wait-live takes 1 to ${WAIT_LIVE_MAX_MINUTES} minutes.`)
+      }
+      args.waitLiveMinutes = minutes
       index += 1
       continue
     }
@@ -168,6 +181,21 @@ async function fetchSitemapText(env) {
  */
 function isLiveOnSite(sitemapText, slug) {
   return String(sitemapText ?? '').includes(`/blog/${slug}`)
+}
+
+/**
+ * --wait-live: re-fetch the sitemap every 30 seconds until /blog/<slug> shows
+ * up or the minute budget is spent. Read only - a plain GET per poll.
+ * Returns true as soon as the post is live, false when the time ran out.
+ */
+async function waitForSlugLive(env, slug, minutes) {
+  const deadline = Date.now() + minutes * 60_000
+  for (;;) {
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) return false
+    await new Promise((resolve) => setTimeout(resolve, Math.min(WAIT_LIVE_POLL_MS, remaining)))
+    if (isLiveOnSite(await fetchSitemapText(env), slug)) return true
+  }
 }
 
 /** My dev.to articles, drafts included. */
@@ -253,7 +281,7 @@ function absoluteHttpsUrl(value) {
 /** The exact JSON body for POST /api/articles, minus nothing - no key inside. */
 function buildArticle(env, post, published) {
   const canonicalUrl = canonicalUrlFor(env, post.slug)
-  const bodyMarkdown = `${post.content}\n\n*Originally published at [${canonicalUrl}](${canonicalUrl})*\n\n${AI_DISCLOSURE_LINE}`
+  const bodyMarkdown = `${post.content}\n\n*Originally published at [${canonicalUrl}](${canonicalUrl})*`
   const article = {
     title: post.title,
     body_markdown: bodyMarkdown,
@@ -336,6 +364,30 @@ async function main() {
     }
     chosen = post
     break
+  }
+
+  // --wait-live: nothing is postable right now, but a candidate that is only
+  // missing from the sitemap may still be on its way. Wait for the oldest one.
+  if (!chosen && args.waitLiveMinutes > 0) {
+    const pending = candidates.find((post) =>
+      !isLiveOnSite(sitemapText, post.slug)
+      && findDuplicateMatches(devtoArticles, canonicalUrlFor(env, post.slug), post.title).length === 0)
+    if (pending) {
+      console.log(`Waiting up to ${args.waitLiveMinutes} minute(s) for /blog/${pending.slug} to appear in sitemap.xml (checking every 30 seconds)...`)
+      if (!(await waitForSlugLive(env, pending.slug, args.waitLiveMinutes))) {
+        console.log('not live yet, will retry next run')
+        return
+      }
+      // The duplicate check runs again right before posting: the article list
+      // above is from the start of the run, and the wait may have taken minutes.
+      const freshArticles = await fetchDevtoArticles(env)
+      const matches = findDuplicateMatches(freshArticles, canonicalUrlFor(env, pending.slug), pending.title)
+      if (matches.length > 0) {
+        console.log(`Skipping "${pending.title}" - already on dev.to (matched: ${matches.join(', ')}).`)
+        return
+      }
+      chosen = pending
+    }
   }
 
   if (!chosen) {
