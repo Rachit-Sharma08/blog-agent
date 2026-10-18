@@ -30,6 +30,8 @@
  * secret values are never printed anywhere.
  */
 
+import { appendFileSync } from 'node:fs'
+
 const SAVE = process.argv.includes('--save')
 
 const REQUIRED_ENV = [
@@ -444,6 +446,14 @@ async function main() {
   await insertDraft(env, draft, finalSlug)
   console.log(`Saved as an unpublished draft: slug "${finalSlug}" (published=false, published_at=null).`)
   console.log('The rebuild/deploy hook was deliberately not called - publish from /admin when ready.')
+
+  // Review window: hand the slug and title to the workflow that asked for
+  // them, on one line each. Nothing is written when GITHUB_OUTPUT is unset.
+  const githubOutput = String(process.env.GITHUB_OUTPUT ?? '').trim()
+  if (githubOutput) {
+    const titleOnOneLine = String(draft.title).replace(/[\r\n]+/g, ' ')
+    appendFileSync(githubOutput, `slug=${finalSlug}\ntitle=${titleOnOneLine}\n`)
+  }
 }
 
 main().catch((error) => {
