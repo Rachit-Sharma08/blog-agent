@@ -153,7 +153,14 @@ function bulletList(items) {
 function buildPrompt({ existing, recent }) {
   return `You are writing one new draft for the personal blog of Rachit Sharma, a digital marketer from Kaithal, Haryana, India who works hands-on with AI tools. The blog's beat is digital marketing and AI work.
 
-Voice: first person, calm and concrete - specific process, honest trade-offs. No hype, no filler ("in today's fast-paced world"), no keyword stuffing. Short paragraphs.
+Voice: calm and concrete - specific process, honest trade-offs. First person only for opinions and the recommended approach. No hype, no filler, no keyword stuffing. Short paragraphs.
+
+STYLE - how the post should read:
+  - Write like a practical digital marketer explaining something to a colleague: plain everyday words, mostly short sentences, contractions are fine (it's, don't, you'll), speak directly to the reader with "you".
+  - Vary sentence length. Start some sentences with "But", "So" or "And". Be specific and concrete instead of general.
+  - Do NOT use these words or phrases: delve, landscape, leverage, unlock, game-changer, seamless, robust, tapestry, navigate (as in "navigate the world of"), in today's fast-paced world, in the ever-evolving, it's important to note, it's worth noting, in conclusion, ultimately, at the end of the day, whether you're a ... or a ....
+  - Do NOT use em dashes (the long dash). Use a comma, a full stop or brackets instead.
+  - No tidy summary paragraph at the end, no motivational or moral closing line, no rhetorical lists of exactly three adjectives.
 
 FACTUAL HONESTY - these posts are published under a real person's name, so nothing may be made up:
   - Never invent clients, companies, case studies, personal experiences, past events, quotes or results. Never write sentences like "last year I...", "a client of mine...", "when we did this for...".
@@ -390,6 +397,40 @@ function warnOnFabrication(draft) {
   console.log('The draft is NOT blocked - but these phrases must not be published under a real name. Rewrite or delete them first.')
 }
 
+/**
+ * Soft check on the STYLE rules in the prompt: an em dash or one of the
+ * banned words/phrases only earns one WARNING line listing what matched.
+ * Nothing is blocked and nothing is edited - the draft is reported as-is.
+ */
+const STYLE_BANNED = [
+  { label: 'em dash', regex: /\u2014/ },
+  { label: 'delve', regex: /\bdelve\b/i },
+  { label: 'landscape', regex: /\blandscape\b/i },
+  { label: 'leverage', regex: /\bleverage\b/i },
+  { label: 'unlock', regex: /\bunlock\b/i },
+  { label: 'game-changer', regex: /\bgame-changer\b/i },
+  { label: 'seamless', regex: /\bseamless\b/i },
+  { label: 'robust', regex: /\brobust\b/i },
+  { label: 'tapestry', regex: /\btapestry\b/i },
+  { label: 'navigate', regex: /\bnavigate\b/i },
+  { label: "in today's fast-paced world", regex: /in today['\u2019]s fast-paced world/i },
+  { label: 'in the ever-evolving', regex: /in the ever-evolving/i },
+  { label: "it's important to note", regex: /it['\u2019]s important to note/i },
+  { label: "it's worth noting", regex: /it['\u2019]s worth noting/i },
+  { label: 'in conclusion', regex: /\bin conclusion\b/i },
+  { label: 'ultimately', regex: /\bultimately\b/i },
+  { label: 'at the end of the day', regex: /at the end of the day/i },
+  { label: "whether you're a ... or a ...", regex: /whether you['\u2019]re an? [^.!?]*\bor an? /i },
+]
+
+function warnOnStyle(draft) {
+  const text = String(draft?.content ?? '')
+  const hits = STYLE_BANNED.filter((entry) => entry.regex.test(text)).map((entry) => entry.label)
+  if (hits.length === 0) return
+  console.log('')
+  console.log(`WARNING: STYLE rule(s) matched in the draft (not blocked, not edited - fix by hand): ${hits.join(', ')}.`)
+}
+
 function printDraft(draft) {
   console.log('')
   console.log('--- Draft -------------------------------------------------------')
@@ -431,6 +472,7 @@ async function main() {
 
   console.log(`Provider used: ${provider}`)
   warnOnFabrication(draft)
+  warnOnStyle(draft)
   printDraft(draft)
 
   if (!SAVE) {
